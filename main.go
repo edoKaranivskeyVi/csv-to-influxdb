@@ -32,9 +32,51 @@ type config struct {
 	NoAutoCreate    bool   `help:"Disable automatic creation of database"`
 	ForceFloat      bool   `help:"Force all numeric values to insert as float"`
 	ForceString     bool   `help:"Force all numeric values to insert as string"`
-	TreatNull	bool   `help:"Force treating "null" string values as such`
+	TreatNull       bool   `help:"Force treating "null" string values as such`
 	Attempts        int    `help:"Maximum number of attempts to send data to influxdb before failing"`
-	HttpTimeout	int    `help:"Timeout (in seconds) for http writes used by underlying influxdb client"`
+	HttpTimeout     int    `help:"Timeout (in seconds) for http writes used by underlying influxdb client"`
+	Transport       string `short:"tr" help:"HTTP|UDP"`
+	PayloadSize     int    `short:"pl" help:"PayloadSize is the maximum size of a UDP client message"`
+}
+
+// initialization actions for http and udp clients according to conf.Transport parameter
+func createClient(conf config) (client.Client, error) {
+
+	switch conf.Transport {
+	case "HTTP":
+		c, err := client.NewHTTPClient(client.HTTPConfig{Addr: conf.Server, Username: conf.Username, Password: conf.Password, Timeout: time.Duration(conf.HttpTimeout) * time.Second})
+		dbsResp, err := c.Query(client.Query{Command: "SHOW DATABASES"})
+		if err != nil {
+			log.Fatalf("Invalid server address: %s", err)
+		}
+
+		dbExists := false
+
+		if len(dbsResp.Results) == 0 {
+			log.Fatalf("No databases found, probably an authentication issue, please provide username and password.")
+		}
+		for _, v := range dbsResp.Results[0].Series[0].Values {
+			dbName := v[0].(string)
+			if conf.Database == dbName {
+				dbExists = true
+				break
+			}
+		}
+		if !dbExists {
+			if conf.NoAutoCreate {
+				log.Fatalf("Database '%s' does not exist", conf.Database)
+			}
+			_, err := c.Query(client.Query{Command: "CREATE DATABASE \"" + conf.Database + "\""})
+			if err != nil {
+				log.Fatalf("Failed to create database: %s", err)
+			}
+		}
+		return c, err
+	case "UDP":
+		return client.NewUDPClient(client.UDPConfig{Addr: conf.Server, PayloadSize: conf.PayloadSize})
+	}
+	err := fmt.Errorf("%s is not a valid client transport value", conf.Transport)
+	return nil, err
 }
 
 func main() {
@@ -52,7 +94,9 @@ func main() {
 		TreatNull:       false,
 		TimestampColumn: "timestamp",
 		TimestampFormat: "2006-01-02 15:04:05",
-		HttpTimeout:	 10,
+		HttpTimeout:     10,
+		Transport:       "HTTP",
+		PayloadSize:     0,
 	}
 
 	//parse config
@@ -83,40 +127,16 @@ func main() {
 		log.Fatalf("time stamp regexp creation failed")
 	}
 
-	//influxdb client
-	//u, err := url.Parse(conf.Server)
-	//if err != nil {
-	//	log.Fatalf("Invalid server address: %s", err)
-	//}
-	c, err := client.NewHTTPClient(client.HTTPConfig{Addr: conf.Server, Username: conf.Username, Password: conf.Password, Timeout: time.Duration(conf.HttpTimeout) * time.Second})
-	defer c.Close()
+	// initialization actions for http and udp clients according to conf.Transport parameter
+	c, err := createClient(conf)
 
-	dbsResp, err := c.Query(client.Query{Command: "SHOW DATABASES"})
 	if err != nil {
-		log.Fatalf("Invalid server address: %s", err)
+		log.Fatalf("Invalid Client: %s\n", err)
+	} else {
+		log.Printf("%s Client Created", conf.Transport)
 	}
 
-	dbExists := false
-	if len(dbsResp.Results) == 0 {
-		log.Fatalf("No databases found, probably an authentication issue, please provide username and password.")
-	}
-	for _, v := range dbsResp.Results[0].Series[0].Values {
-		dbName := v[0].(string)
-		if conf.Database == dbName {
-			dbExists = true
-			break
-		}
-	}
-
-	if !dbExists {
-		if conf.NoAutoCreate {
-			log.Fatalf("Database '%s' does not exist", conf.Database)
-		}
-		_, err := c.Query(client.Query{Command: "CREATE DATABASE \"" + conf.Database + "\""})
-		if err != nil {
-			log.Fatalf("Failed to create database: %s", err)
-		}
-	}
+	defer c.Close()
 
 	//open csv file
 	f, err := os.Open(conf.CSVFile)
